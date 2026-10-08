@@ -3,3 +3,4 @@ target/
 *.tfstate*
 .idea/
 terraform/backend.tf
+.DS_Store
