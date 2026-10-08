@@ -1,0 +1,17 @@
+services:
+  discovery-server:
+    build: { context: ., args: { MODULE: discovery-server } }
+    ports: ["8761:8761"]
+  api-gateway:
+    build: { context: ., args: { MODULE: api-gateway } }
+    environment: { EUREKA_URL: "http://discovery-server:8761/eureka" }
+    ports: ["8080:8080"]
+    depends_on: [discovery-server]
+  product-service:
+    build: { context: ., args: { MODULE: product-service } }
+    environment: { EUREKA_URL: "http://discovery-server:8761/eureka" }
+    depends_on: [discovery-server]
+  order-service:
+    build: { context: ., args: { MODULE: order-service } }
+    environment: { EUREKA_URL: "http://discovery-server:8761/eureka" }
+    depends_on: [discovery-server]

@@ -1,0 +1,16 @@
+server:
+  port: 8761
+spring:
+  application:
+    name: discovery-server
+eureka:
+  client:
+    register-with-eureka: false   # the server does not register with itself
+    fetch-registry: false
+  server:
+    enable-self-preservation: false   # evict dead instances quickly (good for demos)
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info

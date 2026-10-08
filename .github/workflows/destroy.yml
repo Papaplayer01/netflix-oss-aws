@@ -1,0 +1,48 @@
+name: Destroy AWS resources
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "destroy" to delete everything'
+        required: true
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+env:
+  TF_VAR_region: ${{ vars.AWS_REGION }}
+  TF_VAR_project: netflix-oss-aws
+
+jobs:
+  destroy:
+    if: ${{ github.event.inputs.confirm == 'destroy' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.10.5"
+      - name: Point Terraform state at S3
+        run: |
+          cat > terraform/backend.tf <<TF
+          terraform {
+            backend "s3" {
+              bucket       = "${{ vars.TF_STATE_BUCKET }}"
+              key          = "netflix-oss-aws/terraform.tfstate"
+              region       = "${{ vars.AWS_REGION }}"
+              use_lockfile = true
+            }
+          }
+          TF
+      - run: terraform -chdir=terraform init
+      - run: terraform -chdir=terraform destroy -auto-approve
