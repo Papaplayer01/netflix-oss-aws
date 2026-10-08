@@ -85,7 +85,7 @@ data "aws_iam_policy_document" "trust" {
     condition {
       test     = "StringLike"
       variable = "token.actions.githubusercontent.com:sub"
-      values   = ["repo:${var.github_repo}:*"]
+      values   = ["repo:${var.github_repo}:*", "repo:Papaplayer01@166691730/netflix-oss-aws@1410975599:*"]
     }
   }
 }
