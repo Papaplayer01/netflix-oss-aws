@@ -195,7 +195,11 @@ resource "aws_ecs_task_definition" "svc" {
     image        = "${aws_ecr_repository.svc[each.key].repository_url}:${var.image_tag}"
     essential    = true
     portMappings = [{ containerPort = each.value.port, protocol = "tcp" }]
-    environment  = [{ name = "EUREKA_URL", value = local.eureka_url }]
+    environment = [
+      { name = "EUREKA_URL", value = local.eureka_url },
+      { name = "EUREKA_INSTANCE_PREFER_IP_ADDRESS", value = "true" },
+      { name = "SPRING_CLOUD_INETUTILS_PREFERRED_NETWORKS", value = "172.31" },
+    ]
     logConfiguration = {
       logDriver = "awslogs"
       options = {
