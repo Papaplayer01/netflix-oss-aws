@@ -1,138 +1,164 @@
-# Netflix-OSS-style Microservices on AWS (Fargate + Terraform)
+# Netflix OSS Microservices on AWS
 
-A small but complete project that shows the **Netflix OSS pattern set** running on **AWS**.
-Built to talk about in an IBM Consulting (AWS Application Consultant) interview.
+A small online shop built as four Spring Cloud microservices (the Netflix OSS pattern), deployed to AWS ECS Fargate with Terraform and a GitHub Actions pipeline that logs in to AWS through OIDC, so no AWS keys are stored in GitHub.
 
 ## What it does
 
-A client calls one URL. The gateway forwards the call to the right service.
-`order-service` asks `product-service` for a price. If `product-service` breaks,
-`order-service` does not crash: the circuit breaker returns a safe fallback answer.
+You send requests to one public URL. An API gateway forwards each request to the right service, and the services find each other through a service registry.
 
-```
-                    Internet
-                       |
-                 [ AWS ALB ]
-                       |
-              [ api-gateway ]  (Spring Cloud Gateway)
-               /            \
-   [ product-service ]   [ order-service ] --(circuit breaker)--> product-service
-               \            /
-             [ discovery-server ]  (Eureka)   <- found by DNS name through AWS Cloud Map
-```
-
-## Netflix OSS role -> what is used here
-
-| Role | Original Netflix tool | Used in this project | AWS-native alternative |
-|---|---|---|---|
-| Service discovery | Eureka | Eureka (Spring Cloud Netflix) | Cloud Map / ECS Service Connect |
-| API gateway | Zuul | Spring Cloud Gateway | Amazon API Gateway |
-| Client load balancing | Ribbon | `@LoadBalanced` + Spring Cloud LoadBalancer | ALB |
-| Circuit breaker | Hystrix | Resilience4j | App Mesh / retries in the SDK |
-| Config | Archaius | env vars (`EUREKA_URL`) | AppConfig, SSM Parameter Store |
-
-Ribbon and Hystrix are retired; the Spring replacements above are what real projects use today.
-
-## Services
-
-| Module | Port | Job |
+| Service | Role | Port |
 |---|---|---|
-| discovery-server | 8761 | Eureka registry |
-| api-gateway | 8080 | Public entry, routes `/api/products/**` and `/api/orders/**` |
-| product-service | 8081 | `GET /api/products`, `GET /api/products/{id}`, `POST /api/products/chaos?fail=true` |
-| order-service | 8082 | `POST /api/orders`, `GET /api/orders` |
+| `discovery-server` | Eureka service registry. Every service registers here so others can find it. | 8761 |
+| `api-gateway` | Spring Cloud Gateway. The only public entry point. Routes `/api/**` to the right service. | 8080 |
+| `product-service` | Returns the product catalog. Has a chaos switch to simulate failure. | 8081 |
+| `order-service` | Creates orders. Calls the product service for prices, protected by a Resilience4j circuit breaker. | 8082 |
 
-## Run locally (Docker needed)
+## Architecture
 
-```bash
-docker compose up --build
-# Eureka dashboard: http://localhost:8761  (wait ~40s until all services show up)
-
-curl http://localhost:8080/api/products
-curl -X POST http://localhost:8080/api/orders -H 'Content-Type: application/json' \
-     -d '{"productId":1,"quantity":2}'
-# -> status CONFIRMED, total 110000
+```
+Internet
+   |
+   v
+Application Load Balancer (port 80)
+   |
+   v
+api-gateway (8080)  ----- looks up services ----->  discovery-server (Eureka, 8761)
+   |                                                      ^
+   |-- /api/products --> product-service (8081) ----------|  (all services register)
+   |-- /api/orders   --> order-service   (8082) ----------|
+                              |
+                              +-- calls product-service (circuit breaker)
 ```
 
-### Demo the circuit breaker (great for the interview)
+**AWS building blocks**
+
+- **ECS Fargate** runs the four containers without any servers to manage.
+- **Application Load Balancer** is the public entry point and forwards traffic to the gateway.
+- **ECR** stores one Docker image repository per service.
+- **Cloud Map (private DNS)** lets services reach the Eureka server by name.
+- **CloudWatch Logs** collects each service's logs (one log group per service).
+- **Terraform** defines all of the above as code.
+- **S3** holds the remote Terraform state.
+- **GitHub Actions + OIDC** builds, pushes and deploys without stored credentials.
+
+## Circuit breaker
+
+The order service calls the product service to get a price. If the product service fails, the circuit breaker opens and the order service returns a safe fallback instead of hanging or crashing:
+
+- Product service healthy: order status `CONFIRMED`
+- Product service down: order status `PENDING_PRODUCT_SERVICE_UNAVAILABLE`
+- After the product service recovers (about 20 seconds), the breaker closes and orders return to `CONFIRMED`
+
+## API
+
+Replace `$URL` with your load balancer address, for example `http://<alb-dns-name>`.
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/api/products` | List all products |
+| POST | `/api/orders` | Create an order |
+| POST | `/api/products/chaos?fail=true` | Make the product service fail (demo) |
+| POST | `/api/products/chaos?fail=false` | Restore the product service |
 
 ```bash
-curl -X POST "http://localhost:8080/api/products/chaos?fail=true"   # break product-service
+# List products
+curl $URL/api/products
+
+# Place an order
+curl -X POST $URL/api/orders \
+  -H "Content-Type: application/json" \
+  -d '{"productId":1,"quantity":2}'
+# {"id":1,"productId":1,"quantity":2,"total":110000.0,"status":"CONFIRMED"}
+```
+
+### Circuit breaker demo
+
+```bash
+# 1. Break the product service
+curl -X POST "$URL/api/products/chaos?fail=true"
+
+# 2. Place orders: they now return PENDING_PRODUCT_SERVICE_UNAVAILABLE
 for i in 1 2 3 4 5; do
-  curl -s -X POST http://localhost:8080/api/orders -H 'Content-Type: application/json' \
-       -d '{"productId":1,"quantity":1}'; echo
+  curl -s -X POST $URL/api/orders -H "Content-Type: application/json" \
+    -d '{"productId":1,"quantity":1}'; echo
 done
-# -> status PENDING_PRODUCT_SERVICE_UNAVAILABLE (fallback). After a few failures the circuit
-#    opens and the fallback is returned instantly without calling product-service.
-curl -X POST "http://localhost:8080/api/products/chaos?fail=false"  # heal it
-# wait ~10s (open state) and orders become CONFIRMED again
+
+# 3. Heal it, wait 20 seconds, order again: back to CONFIRMED
+curl -X POST "$URL/api/products/chaos?fail=false"
+sleep 20
+curl -s -X POST $URL/api/orders -H "Content-Type: application/json" \
+  -d '{"productId":1,"quantity":1}'
 ```
 
-## Deploy to AWS
+## Repository layout
 
-Needs: AWS CLI configured, Docker, Terraform >= 1.5.
+```
+.github/workflows/   deploy.yml and destroy.yml (GitHub Actions)
+terraform/           main infrastructure: ECS, ALB, ECR, Cloud Map, IAM, logs
+bootstrap/           one-time setup: S3 state bucket and the GitHub OIDC role
+```
+
+## Deploying
+
+**One-time bootstrap** (needs AWS credentials once, from your machine). It creates the S3 bucket for Terraform state and the IAM role that GitHub Actions assumes through OIDC:
 
 ```bash
-./deploy.sh                 # about 10 minutes
-# prints gateway_url = http://<alb-dns-name>
-curl http://<alb-dns-name>/api/products
-./destroy.sh                # DELETE everything when done
+cd bootstrap
+terraform init
+terraform apply -var "github_repo=<owner>/<repo>"
 ```
 
-What Terraform creates: 4 ECR repos, ECS cluster, 4 Fargate services, an ALB in front of the
-gateway, a Cloud Map private DNS namespace (`discovery.netflix.local` -> Eureka),
-security groups, IAM role, CloudWatch log groups.
+Then set the outputs it prints (AWS region, role ARN, state bucket) in the repository's GitHub Actions configuration.
 
-**Cost warning:** 4 Fargate tasks (0.5 vCPU / 1 GB each) plus an ALB cost roughly a few US dollars
-per day. Run `./destroy.sh` right after your demo.
+**Deploy** by running the workflow from the Actions tab, or:
 
-## Interview talking points
+```bash
+gh workflow run "Deploy to AWS" --repo <owner>/<repo>
+```
 
-1. **Why Eureka on AWS?** Eureka keeps the Spring/Netflix programming model. Cloud Map provides the
-   DNS name where Eureka itself is found. A fully AWS-native design could drop Eureka and use ECS Service Connect.
-2. **Why Fargate?** No servers to patch; each service scales on its own.
-3. **Circuit breaker:** open / half-open / closed. Prevents one slow service from taking down everything.
-4. **Garage Method link:** Co-create = start with one service MVP. Co-execute = Terraform + Docker pipeline.
-   Co-operate = CloudWatch logs, health checks, fallback behaviour.
-5. **Honest limitations (say these, consultants are expected to):** in-memory data (no database),
-   public subnets to avoid NAT cost, no auth, single task per service. Next steps: RDS/DynamoDB, private subnets,
-   Cognito/JWT at the gateway, autoscaling, CI/CD with GitHub Actions, X-Ray tracing.
+The workflow builds the images, pushes them to ECR, and applies the Terraform in `terraform/`. When it finishes, get the URL:
 
-## Project ideas to extend (pick one to show growth)
+```bash
+aws elbv2 describe-load-balancers --names netflix-oss-aws-alb --region ap-south-1 \
+  --query 'LoadBalancers[0].DNSName' --output text
+```
 
-- Replace in-memory orders with DynamoDB or RDS (Terraform module).
-- Add JWT validation in the gateway with Cognito.
-- Add a GitHub Actions workflow that builds, pushes and deploys on every commit.
-- Add ECS autoscaling on CPU.
+Wait 2 to 3 minutes after the run turns green so the services can register with Eureka. A 502 or 503 during that window is normal.
 
-## CI/CD with GitHub Actions
+## Tearing down
 
-Three workflows live in `.github/workflows/`:
+The system costs a few US dollars per day while it runs. Destroy it when you're done:
 
-| Workflow | When | What it does |
-|---|---|---|
-| `ci.yml` | pull requests and pushes to any branch except `main` | `mvn verify` for all services, `terraform fmt` and `validate` |
-| `deploy.yml` | push to `main`, or run manually | builds 4 images tagged with the commit SHA, pushes to ECR, `terraform apply` |
-| `destroy.yml` | manual only (type `destroy`) | deletes all AWS resources |
+```bash
+gh workflow run "Destroy AWS resources" --repo <owner>/<repo> -f confirm=destroy
+```
 
-**No AWS keys are stored in GitHub.** Actions logs in with OIDC and assumes an IAM role that only this
-repository can use. Terraform state is kept in S3 because Actions runners are thrown away after every run.
+It takes about 8 minutes. Afterward, confirm nothing is left:
 
-### One-time setup
+```bash
+aws ecs list-clusters --region ap-south-1
+aws elbv2 describe-load-balancers --region ap-south-1 --query 'LoadBalancers[].LoadBalancerName'
+```
 
-1. Create a GitHub repo and push this project (default branch `main`).
-2. From your laptop (AWS CLI configured), create the trust, role and state bucket:
-   ```bash
-   cd bootstrap
-   terraform init
-   terraform apply -var "github_repo=YOUR_GITHUB_USERNAME/YOUR_REPO_NAME"
-   ```
-   If it says the OIDC provider already exists, add `-var "create_oidc_provider=false"`.
-   Keep the `bootstrap/terraform.tfstate` file safe.
-3. In GitHub: Settings -> Secrets and variables -> Actions:
-   - **Secret** `AWS_ROLE_ARN` = output `AWS_ROLE_ARN`
-   - **Variable** `TF_STATE_BUCKET` = output `TF_STATE_BUCKET`
-   - **Variable** `AWS_REGION` = output `AWS_REGION` (e.g. `ap-south-1`)
-4. Push a commit to `main`, or run **Deploy to AWS** from the Actions tab. The URL appears in the run summary.
-5. When finished: Actions -> **Destroy AWS resources** -> type `destroy`.
-   Optionally run `terraform destroy` in `bootstrap/` to remove the state bucket and role.
+To also remove the state bucket and OIDC role, run `terraform destroy` in `bootstrap/` (only after the destroy workflow has finished).
+
+## Problems solved along the way
+
+**1. GitHub OIDC login rejected by AWS.** GitHub's token identified the repository in a different format than the IAM trust policy expected, so AWS refused to issue credentials. I read the token's `sub` claim and updated the role's trust policy to accept it.
+
+**2. Gateway returned 500 with "connection refused".** Everything showed as running, but requests failed. The gateway logs showed it trying to reach `169.254.172.2:8081`. On Fargate, each service was registering with Eureka using a container-local link-local address that only exists inside its own container, so the gateway tried to connect to itself. Fix: register the task's VPC address instead, by adding these environment variables to the task definition:
+
+```
+EUREKA_INSTANCE_PREFER_IP_ADDRESS=true
+SPRING_CLOUD_INETUTILS_PREFERRED_NETWORKS=172.31
+```
+
+## Known limits and next steps
+
+This is a learning project, and the limits are deliberate:
+
+- No database: data is held in memory, so it resets when a service restarts. Next: DynamoDB or RDS.
+- No authentication: anyone with the URL can place orders. Next: Cognito or JWT at the gateway.
+- Public subnets in the default VPC, to avoid the cost of a NAT gateway. Next: private subnets with VPC endpoints.
+- One copy of each service. Next: ECS autoscaling and more than one task per service.
+- HTTP only. Next: HTTPS with an ACM certificate on the load balancer.
